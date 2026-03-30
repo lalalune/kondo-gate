@@ -96,18 +96,6 @@ pip install -e ".[dev]"
 pytest
 ```
 
-60 tests across 10 categories:
-- Config validation (bounds, mutual exclusivity, defaults)
-- Delight computation (formula correctness, detachment, edge cases)
-- Gate mechanism (output shapes, hard/soft modes, adaptive rate targeting)
-- Full forward pass (2D/3D logits, attention masking, loss finiteness)
-- Mathematical properties (sigmoid formula, temperature limits, price monotonicity)
-- Gradient verification (flow through hard/soft gates, zero-grad for gated-out samples)
-- Integration (multi-step training loops, parameter updates)
-- Edge cases (batch=1, zero advantages, empty masks, reproducibility)
-- Deterministic mode (top-k selection, reference impl match, reproducibility)
-- Loss functions (PG, DG, DG-K structure, baseline computation)
-
 ## Examples
 
 ### MNIST contextual bandit (PG vs DG vs DG-K)
