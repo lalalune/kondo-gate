@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+__version__ = "0.1.0"
+
 
 @dataclass
 class KondoGateConfig:
@@ -143,16 +145,16 @@ class KondoGate(nn.Module):
         gate_probs = torch.sigmoid(gate_logits)
 
         if self.config.hard:
-            # Bernoulli sample with straight-through gradient
-            gate_samples = torch.bernoulli(gate_probs.detach())
-            # Straight-through: forward uses hard samples, backward uses soft probs
-            gate_weights = gate_samples + gate_probs - gate_probs.detach()
+            # Binary gate: sample from Bernoulli, no gradient through gate.
+            # Per Algorithm 1, the gate is a pure sample selector —
+            # delight is detached so the gate has no grad path to model params.
+            gate_weights = torch.bernoulli(gate_probs).detach()
         else:
             gate_weights = gate_probs
 
         # Stats
         with torch.no_grad():
-            actual_rate = gate_samples.mean() if self.config.hard else gate_probs.mean()
+            actual_rate = gate_weights.mean() if self.config.hard else gate_probs.mean()
 
         return KondoGateOutput(
             gate_weights=gate_weights,

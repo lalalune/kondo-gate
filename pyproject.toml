@@ -38,7 +38,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/anthropics/kondo-gate"
+Repository = "https://github.com/lalalune/kondo-gate"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -129,12 +129,9 @@ class TestComputeGate:
         log_probs = torch.randn(100)
         advantages = torch.randn(100)
         out = gate.compute_gate(log_probs, advantages)
-        # In hard mode, the forward value should be near 0 or 1
-        # (straight-through adds gate_probs - gate_probs.detach() for grad,
-        #  but detached values should round cleanly)
-        forward_vals = out.gate_weights.detach()
-        rounded = forward_vals.round()
-        assert torch.allclose(forward_vals, rounded, atol=1e-5)
+        # Hard gate produces exact 0/1 (detached Bernoulli samples)
+        assert ((out.gate_weights == 0) | (out.gate_weights == 1)).all()
+        assert not out.gate_weights.requires_grad
 
     def test_soft_gate_is_continuous(self):
         gate = KondoGate(KondoGateConfig(gate_rate=0.5, hard=False))
