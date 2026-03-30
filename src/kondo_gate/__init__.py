@@ -5,16 +5,16 @@ Standalone PyTorch + HuggingFace Transformers compatible implementation.
 
 Based on arXiv:2603.20526 — "Delightful Policy Gradients with Kondo Gating"
 
-The Kondo gate computes "delight" (advantage × surprisal) for each sample,
-then stochastically gates backward passes so only high-value samples
-contribute gradients. This preserves learning quality while skipping
-most backward passes.
+The Kondo gate computes "delight" (advantage x surprisal) for each sample,
+then gates backward passes so only high-value samples contribute gradients.
+This preserves learning quality while skipping most backward passes.
 
 Core formula:
-    delight  χ = U · ℓ           (advantage × surprisal)
-    gate weight  w* = σ((χ - λ) / η)   (sigmoid soft threshold)
-    gate sample  G ~ Bernoulli(w*)
-    gradient     Δθ += G · U · ∇θ log πθ(a|s)
+    delight  chi = U * ell           (advantage x surprisal)
+    gate weight  w* = sigma((chi - lam) / eta)   (sigmoid soft threshold)
+    gate sample  G ~ Bernoulli(w*)   [stochastic mode]
+    gate select  G = 1{chi >= topk}  [deterministic mode, reference impl]
+    gradient     d_theta += G * U * grad_theta log pi(a|s)
 """
 
 import math
@@ -33,51 +33,64 @@ class KondoGateConfig:
     """Configuration for the Kondo gate.
 
     Args:
-        gate_rate: Target fraction of backward passes to keep (ρ ∈ (0, 1]).
-            When set, λ is adaptively computed as the (1-ρ)-quantile of delight.
-            Mutually exclusive with `price`.
-        price: Fixed compute price threshold (λ ≥ 0). Samples with delight
-            below this are likely gated out. Mutually exclusive with `gate_rate`.
-        temperature: Softness of the gate (η > 0). Lower → harder threshold.
-            As η → 0, becomes indicator 𝕀{χ > λ}.
-            As η → ∞, recovers standard (ungated) policy gradient.
-        hard: If True, use hard Bernoulli sampling (straight-through in forward).
-            If False, use soft (differentiable) gating weights.
+        gate_rate: Target fraction of backward passes to keep (rho in (0, 1]).
+            When set, lambda is adaptively computed as the (1-rho)-quantile
+            of delight. Mutually exclusive with ``price``.
+        price: Fixed compute price threshold (lambda >= 0). Samples with
+            delight below this are likely gated out. Mutually exclusive with
+            ``gate_rate``.
+        temperature: Softness of the gate (eta > 0). Only used in stochastic
+            and soft modes. Lower -> harder threshold.
+            As eta -> 0: indicator 1{chi > lambda}.
+            As eta -> inf: recovers standard (ungated) policy gradient.
+        hard: If True, use hard binary gating. If False, use soft
+            (differentiable) sigmoid gating weights.
+        deterministic: If True (default), use deterministic top-k selection
+            matching the reference implementation. If False, sample from
+            Bernoulli(sigma((chi - lambda) / eta)). Only applies when
+            hard=True.
     """
     gate_rate: Optional[float] = 0.3
     price: Optional[float] = None
     temperature: float = 0.1
     hard: bool = True
+    deterministic: bool = True
 
 
 class KondoGate(nn.Module):
     """Kondo gate module for selective backward-pass gating.
 
-    Computes delight = advantage × surprisal for each sample, then
-    produces a stochastic binary gate that determines whether to
-    include each sample's gradient in the update.
+    Computes delight = advantage x surprisal for each sample, then
+    produces a gate that determines whether to include each sample's
+    gradient in the update.
 
-    Compatible with any model that produces log-probabilities and
-    can be used as a drop-in training utility with HuggingFace
-    Transformers models.
+    Three gating modes:
 
-    Example — standalone REINFORCE with Kondo gating::
+    1. **Deterministic top-k** (hard=True, deterministic=True, default):
+       Matches the reference implementation. Keeps the top rho fraction
+       of samples ranked by delight. Binary, no randomness.
 
-        gate = KondoGate(KondoGateConfig(gate_rate=0.1, temperature=0.05))
+    2. **Stochastic Bernoulli** (hard=True, deterministic=False):
+       Matches Algorithm 1 in the paper. Samples G ~ Bernoulli(w*)
+       where w* = sigma((chi - lambda) / eta).
+
+    3. **Soft sigmoid** (hard=False):
+       Weights each sample by w* = sigma((chi - lambda) / eta).
+       Differentiable but computes all backward passes.
+
+    Example -- standalone REINFORCE with Kondo gating::
+
+        gate = KondoGate(KondoGateConfig(gate_rate=0.1))
         logits = model(input_ids).logits
         result = gate(logits=logits, actions=target_ids, advantages=advantages)
-        loss = result.gated_policy_loss
-        loss.backward()
+        result.gated_policy_loss.backward()
 
-    Example — gating an existing per-token loss::
+    Example -- gating an existing per-token loss::
 
         gate = KondoGate(KondoGateConfig(gate_rate=0.1))
         log_probs = F.log_softmax(logits, dim=-1)
         action_log_probs = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
-        result = gate.compute_gate(
-            log_probs=action_log_probs,
-            advantages=advantages,
-        )
+        result = gate.compute_gate(log_probs=action_log_probs, advantages=advantages)
         gated_loss = -(result.gate_weights * advantages * action_log_probs).mean()
     """
 
@@ -94,7 +107,7 @@ class KondoGate(nn.Module):
 
     @torch.no_grad()
     def _compute_price(self, delight: torch.Tensor) -> torch.Tensor:
-        """Adaptively set price λ as the (1-ρ)-quantile of delight."""
+        """Adaptively set price lambda as the (1-rho)-quantile of delight."""
         if self.config.gate_rate is not None:
             q = 1.0 - self.config.gate_rate
             return torch.quantile(delight.float().detach(), q)
@@ -105,7 +118,7 @@ class KondoGate(nn.Module):
         log_probs: torch.Tensor,
         advantages: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute delight χ = U · ℓ = advantage × surprisal.
+        """Compute delight chi = U * ell = advantage x surprisal.
 
         Args:
             log_probs: Log-probabilities of the taken actions, shape (B,) or (B, T).
@@ -136,23 +149,26 @@ class KondoGate(nn.Module):
         if delight is None:
             delight = self.compute_delight(log_probs, advantages)
 
-        # Flatten for quantile computation if multi-dimensional
+        # Flatten for quantile / top-k computation if multi-dimensional
         flat_delight = delight.reshape(-1)
         price = self._compute_price(flat_delight)
 
-        # Gate probability: w* = σ((χ - λ) / η)
+        # Gate probability: w* = sigma((chi - lambda) / eta)
         gate_logits = (delight - price) / self.config.temperature
         gate_probs = torch.sigmoid(gate_logits)
 
         if self.config.hard:
-            # Binary gate: sample from Bernoulli, no gradient through gate.
-            # Per Algorithm 1, the gate is a pure sample selector —
-            # delight is detached so the gate has no grad path to model params.
-            gate_weights = torch.bernoulli(gate_probs).detach()
+            if self.config.deterministic:
+                # Deterministic top-k: matches reference implementation.
+                # Keep all samples with delight >= price (the quantile threshold).
+                gate_weights = (delight >= price).float().detach()
+            else:
+                # Stochastic Bernoulli: matches Algorithm 1 in the paper.
+                gate_weights = torch.bernoulli(gate_probs).detach()
         else:
+            # Soft sigmoid weights (DG-style, all backward passes computed)
             gate_weights = gate_probs
 
-        # Stats
         with torch.no_grad():
             actual_rate = gate_weights.mean() if self.config.hard else gate_probs.mean()
 
@@ -175,6 +191,9 @@ class KondoGate(nn.Module):
 
         This is the main entry point for use with HuggingFace model outputs.
 
+        The loss follows the reference implementation structure:
+            loss = -mean(log_pi * stop_grad(gate * advantage))
+
         Args:
             logits: Model output logits, shape (B, T, V) or (B, V).
             actions: Action/token indices taken, shape (B, T) or (B,).
@@ -186,11 +205,11 @@ class KondoGate(nn.Module):
         """
         # Compute log-probabilities of taken actions
         if logits.dim() == 3:
-            # (B, T, V) → per-token log-probs
+            # (B, T, V) -> per-token log-probs
             log_probs = F.log_softmax(logits, dim=-1)
             action_log_probs = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
         elif logits.dim() == 2:
-            # (B, V) → per-sample log-probs
+            # (B, V) -> per-sample log-probs
             log_probs = F.log_softmax(logits, dim=-1)
             action_log_probs = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
         else:
@@ -198,28 +217,28 @@ class KondoGate(nn.Module):
 
         # Apply attention mask to get per-sample delight
         if attention_mask is not None and action_log_probs.dim() == 2:
-            # Average over valid tokens for per-sample values
             mask = attention_mask.float()
             masked_log_probs = (action_log_probs * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
             masked_advantages = (advantages * mask).sum(dim=-1) / mask.sum(dim=-1).clamp(min=1)
             delight = self.compute_delight(masked_log_probs, masked_advantages)
 
-            # Compute gate at sample level (B,)
+            # Gate at sample level (B,)
             result = self.compute_gate(masked_log_probs, masked_advantages, delight=delight)
 
-            # Expand gate back to token level for loss
-            gate_weights_expanded = result.gate_weights.unsqueeze(-1)  # (B, 1)
-            gated_loss = -(gate_weights_expanded * advantages * action_log_probs * mask).sum() / mask.sum().clamp(min=1)
+            # Loss: -mean(log_pi * stop_grad(gate * advantage))
+            # Expand gate to token level, apply mask
+            gated_adv = (result.gate_weights.unsqueeze(-1) * advantages * mask).detach()
+            gated_loss = -(action_log_probs * gated_adv).sum() / mask.sum().clamp(min=1)
         elif action_log_probs.dim() == 2:
-            # No mask, per-token gating
             delight = self.compute_delight(action_log_probs, advantages)
             result = self.compute_gate(action_log_probs, advantages, delight=delight)
-            gated_loss = -(result.gate_weights * advantages * action_log_probs).mean()
+            gated_adv = (result.gate_weights * advantages).detach()
+            gated_loss = -(action_log_probs * gated_adv).mean()
         else:
-            # Per-sample (1D)
             delight = self.compute_delight(action_log_probs, advantages)
             result = self.compute_gate(action_log_probs, advantages, delight=delight)
-            gated_loss = -(result.gate_weights * advantages * action_log_probs).mean()
+            gated_adv = (result.gate_weights * advantages).detach()
+            gated_loss = -(action_log_probs * gated_adv).mean()
 
         result.gated_policy_loss = gated_loss
         result.action_log_probs = action_log_probs
@@ -233,9 +252,9 @@ class KondoGateOutput:
     Attributes:
         gate_weights: Per-sample (or per-token) gate values used in the
             gradient computation. Shape matches the input log_probs.
-        gate_probs: Soft gate probabilities σ((χ - λ)/η) before sampling.
-        delight: Computed delight values χ = U · ℓ.
-        price: The compute price λ used (adaptive or fixed).
+        gate_probs: Soft gate probabilities sigma((chi - lambda)/eta).
+        delight: Computed delight values chi = U * ell.
+        price: The compute price lambda used (adaptive or fixed).
         actual_gate_rate: Fraction of samples that passed the gate.
         gated_policy_loss: Scalar loss ready for .backward() (only from forward()).
         action_log_probs: Log-probabilities of taken actions (only from forward()).
@@ -247,6 +266,65 @@ class KondoGateOutput:
     actual_gate_rate: torch.Tensor
     gated_policy_loss: Optional[torch.Tensor] = None
     action_log_probs: Optional[torch.Tensor] = None
+
+
+# ---------------------------------------------------------------------------
+# Loss functions matching the paper's three methods: PG, DG, DG-K
+# ---------------------------------------------------------------------------
+
+
+def pg_loss(
+    logits: torch.Tensor,
+    actions: torch.Tensor,
+    advantages: torch.Tensor,
+) -> torch.Tensor:
+    """Standard REINFORCE policy gradient loss.
+
+    loss = -mean(log pi(a|s) * stop_grad(advantage))
+    """
+    log_probs = F.log_softmax(logits, dim=-1)
+    logp_a = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+    return -(logp_a * advantages.detach()).mean()
+
+
+def dg_loss(
+    logits: torch.Tensor,
+    actions: torch.Tensor,
+    advantages: torch.Tensor,
+    eta: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Delightful policy gradient loss (DG).
+
+    Weights each sample by sigmoid(delight / eta).
+    Computes all backward passes but focuses gradient on informative samples.
+
+    loss = -mean(log pi(a|s) * stop_grad(sigmoid(chi / eta) * advantage))
+
+    Returns (loss, gate_weights).
+    """
+    log_probs = F.log_softmax(logits, dim=-1)
+    logp_a = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+    surprisal = -logp_a.detach()
+    delight = advantages.detach() * surprisal
+    gate = torch.sigmoid(delight / eta)
+    gated_adv = (gate * advantages).detach()
+    loss = -(logp_a * gated_adv).mean()
+    return loss, gate
+
+
+def expected_confidence_baseline(probs: torch.Tensor) -> torch.Tensor:
+    """Expected confidence baseline: b = sum_a pi(a)^2.
+
+    This is the baseline used in the reference MNIST implementation.
+    It approximates E[R] without requiring access to the true label.
+
+    Args:
+        probs: Policy probabilities, shape (B, num_actions).
+
+    Returns:
+        Baseline values, shape (B,).
+    """
+    return (probs ** 2).sum(dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +361,7 @@ class KondoTrainer:
         temperature: float = 0.1,
         price: Optional[float] = None,
         hard: bool = True,
+        deterministic: bool = True,
         lr: float = 3e-4,
         optimizer: Optional[torch.optim.Optimizer] = None,
     ):
@@ -292,6 +371,7 @@ class KondoTrainer:
             price=price,
             temperature=temperature,
             hard=hard,
+            deterministic=deterministic,
         ))
         self.optimizer = optimizer or torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -338,12 +418,11 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     B, T, V = 8, 16, 100  # batch, seq_len, vocab
 
-    # Simulate model outputs
     logits = torch.randn(B, T, V, requires_grad=True)
     actions = torch.randint(0, V, (B, T))
     advantages = torch.randn(B, T)
     mask = torch.ones(B, T)
-    mask[:, -3:] = 0  # mask out last 3 tokens
+    mask[:, -3:] = 0
 
     print("=== Kondo Gate Demo ===\n")
 

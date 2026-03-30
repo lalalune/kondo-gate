@@ -11,7 +11,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kondo_gate import KondoGate, KondoGateConfig, KondoGateOutput, KondoTrainer
+from kondo_gate import (
+    KondoGate, KondoGateConfig, KondoGateOutput, KondoTrainer,
+    pg_loss, dg_loss, expected_confidence_baseline,
+)
 
 
 # ============================================================================
@@ -28,6 +31,7 @@ class TestKondoGateConfig:
         assert cfg.price is None
         assert cfg.temperature == 0.1
         assert cfg.hard is True
+        assert cfg.deterministic is True
 
     def test_gate_rate_and_price_mutually_exclusive(self):
         with pytest.raises(ValueError, match="either gate_rate or price"):
@@ -619,6 +623,151 @@ class TestEdgeCases:
         torch.manual_seed(123)
         out2 = gate.compute_gate(log_probs, advantages)
         assert torch.equal(out1.gate_weights.detach(), out2.gate_weights.detach())
+
+
+# ============================================================================
+# Deterministic vs Stochastic Mode
+# ============================================================================
+
+
+class TestDeterministicMode:
+    """Test deterministic top-k gate (matching reference implementation)."""
+
+    def test_deterministic_is_default(self):
+        gate = KondoGate()
+        assert gate.config.deterministic is True
+
+    def test_deterministic_is_reproducible_without_seed(self):
+        """Deterministic mode should give same results without setting seed."""
+        gate = KondoGate(KondoGateConfig(gate_rate=0.3, deterministic=True))
+        log_probs = torch.randn(32)
+        advantages = torch.randn(32)
+        out1 = gate.compute_gate(log_probs, advantages)
+        out2 = gate.compute_gate(log_probs, advantages)
+        assert torch.equal(out1.gate_weights, out2.gate_weights)
+
+    def test_deterministic_selects_top_k(self):
+        """Deterministic mode keeps samples with delight >= quantile threshold."""
+        gate = KondoGate(KondoGateConfig(gate_rate=0.3, deterministic=True))
+        log_probs = torch.tensor([-1.0, -2.0, -3.0, -4.0, -5.0,
+                                   -0.5, -1.5, -2.5, -3.5, -4.5])
+        advantages = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0,
+                                    1.0, 1.0, 1.0, 1.0, 1.0])
+        out = gate.compute_gate(log_probs, advantages)
+        # Delight = surprisal (since all advantages = 1)
+        # = [1, 2, 3, 4, 5, 0.5, 1.5, 2.5, 3.5, 4.5]
+        # Top 30% = 3 samples: indices with delight 5, 4.5, 4
+        passed = out.gate_weights.nonzero().squeeze(-1)
+        passed_delights = out.delight[passed]
+        skipped_delights = out.delight[out.gate_weights == 0]
+        # All passed delights should be >= all skipped delights
+        if len(passed_delights) > 0 and len(skipped_delights) > 0:
+            assert passed_delights.min() >= skipped_delights.max()
+
+    def test_stochastic_mode_differs_across_seeds(self):
+        """Stochastic mode should give different results with different seeds."""
+        gate = KondoGate(KondoGateConfig(gate_rate=0.5, deterministic=False))
+        log_probs = torch.randn(100)
+        advantages = torch.randn(100)
+        torch.manual_seed(0)
+        out1 = gate.compute_gate(log_probs, advantages)
+        torch.manual_seed(99)
+        out2 = gate.compute_gate(log_probs, advantages)
+        # Very unlikely to be identical with different seeds
+        assert not torch.equal(out1.gate_weights, out2.gate_weights)
+
+    def test_deterministic_matches_reference_impl(self):
+        """Verify deterministic gate matches the Colab reference exactly."""
+        # Reference: k = int(rho * B), threshold = sort(delight)[B-k], gate = delight >= threshold
+        B = 20
+        rho = 0.3
+        gate = KondoGate(KondoGateConfig(gate_rate=rho, deterministic=True))
+        log_probs = torch.randn(B)
+        advantages = torch.randn(B)
+
+        out = gate.compute_gate(log_probs, advantages)
+        delight = out.delight
+
+        # Manual reference computation
+        k = max(1, int(rho * B))
+        sorted_d, _ = delight.sort()
+        threshold = sorted_d[B - k]
+        expected_gate = (delight >= threshold).float()
+
+        assert torch.equal(out.gate_weights, expected_gate)
+
+
+# ============================================================================
+# Loss Functions (PG, DG, DG-K)
+# ============================================================================
+
+
+class TestLossFunctions:
+    """Test standalone pg_loss, dg_loss, and expected_confidence_baseline."""
+
+    def test_pg_loss_gradient(self):
+        logits = torch.randn(8, 10, requires_grad=True)
+        actions = torch.randint(0, 10, (8,))
+        advantages = torch.randn(8)
+        loss = pg_loss(logits, actions, advantages)
+        loss.backward()
+        assert logits.grad is not None
+        assert torch.isfinite(loss)
+
+    def test_dg_loss_gradient(self):
+        logits = torch.randn(8, 10, requires_grad=True)
+        actions = torch.randint(0, 10, (8,))
+        advantages = torch.randn(8)
+        loss, gate = dg_loss(logits, actions, advantages, eta=1.0)
+        loss.backward()
+        assert logits.grad is not None
+        assert (gate >= 0).all() and (gate <= 1).all()
+
+    def test_dg_loss_with_zero_price_matches_reference(self):
+        """DG uses sigmoid(delight / eta) — no price shift."""
+        torch.manual_seed(42)
+        logits = torch.randn(8, 10, requires_grad=True)
+        actions = torch.randint(0, 10, (8,))
+        advantages = torch.randn(8)
+        _, gate = dg_loss(logits, actions, advantages, eta=1.0)
+
+        # Manual computation
+        log_probs = F.log_softmax(logits.detach(), dim=-1)
+        logp_a = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+        surprisal = -logp_a
+        delight = advantages * surprisal
+        expected_gate = torch.sigmoid(delight / 1.0)
+        assert torch.allclose(gate, expected_gate, atol=1e-5)
+
+    def test_expected_confidence_baseline(self):
+        # Uniform distribution over 10 actions: each p=0.1, sum(p^2) = 10 * 0.01 = 0.1
+        probs = torch.ones(4, 10) / 10
+        baseline = expected_confidence_baseline(probs)
+        assert torch.allclose(baseline, torch.full((4,), 0.1))
+
+    def test_expected_confidence_baseline_one_hot(self):
+        # One-hot: p(a*) = 1, sum(p^2) = 1
+        probs = torch.zeros(2, 5)
+        probs[:, 0] = 1.0
+        baseline = expected_confidence_baseline(probs)
+        assert torch.allclose(baseline, torch.ones(2))
+
+    def test_kondo_loss_matches_reference_structure(self):
+        """Verify: loss = -mean(logp_a * stop_grad(gate * advantage))."""
+        gate = KondoGate(KondoGateConfig(gate_rate=0.5, deterministic=True))
+        logits = torch.randn(16, 10, requires_grad=True)
+        actions = torch.randint(0, 10, (16,))
+        advantages = torch.randn(16)
+
+        result = gate(logits, actions, advantages)
+
+        # Manual reference: loss = -mean(logp_a * stop_grad(gate * adv))
+        log_probs = F.log_softmax(logits, dim=-1)
+        logp_a = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+        gated_adv = (result.gate_weights * advantages).detach()
+        expected_loss = -(logp_a * gated_adv).mean()
+
+        assert torch.allclose(result.gated_policy_loss, expected_loss, atol=1e-6)
 
 
 # ============================================================================
